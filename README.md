@@ -6,6 +6,8 @@ This implementation coordinates value exchange between a Pontmore `customer` (bu
 
 This repository implements PIP-01 `custodial_escrow` using a Lightning hold invoice as the operator's funding lock. The operator controls the invoice claim and outgoing payout, so advertising the service as participant-controlled `lightning_hold_invoice` would understate custody. Its public event log follows [PIP-02](https://github.com/pontmore/protocol/blob/main/PIP-02-swap-state-machine.md), and its dispute and timeout policy follows [PIP-03](https://github.com/pontmore/protocol/blob/main/PIP-03-dispute-policy.md). The canonical protocol repository is the source of truth when this implementation guide conflicts with a PIP.
 
+> **Alternative subtype:** This repository also documents a non-custodial `lightning_hold_invoice` construction where the agent owns the preimage and hold invoice and the arbiter publishes decisions only. See [`docs/IMPL_GUIDE_LIGHTNING_HOLD_INVOICE.md`](docs/IMPL_GUIDE_LIGHTNING_HOLD_INVOICE.md). That guide is the canonical reference for the `lightning_hold_invoice` PIP-01 subtype; this README and [`docs/IMPL_GUIDE.md`](docs/IMPL_GUIDE.md) describe the primary `custodial_escrow` construction.
+
 ### Pontmore role mapping
 
 | Pontmore role | UI alias in this repository | Responsibility |
@@ -310,7 +312,8 @@ The PIP-02 event grammar and PIP-03 policy boundary can remain compatible, but t
 pontmore/
 ├── README.md
 ├── docs/
-│   └── IMPL_GUIDE.md
+│   ├── IMPL_GUIDE.md                           ← primary: custodial_escrow (operator-controlled)
+│   └── IMPL_GUIDE_LIGHTNING_HOLD_INVOICE.md     ← alternative: lightning_hold_invoice (agent-controlled)
 ├── src/
 │   ├── nostr/             ← Nostr identity, event signing, NIP-44, Gift Wrap
 │   ├── swap/              ← PIP-02 request and append-only state history

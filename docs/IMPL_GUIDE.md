@@ -2,6 +2,8 @@
 
 A step-by-step guide to building a Pontmore-compatible, Nostr-coordinated, node-controlled Lightning hold-invoice escrow. Under PIP-01 this is `custodial_escrow` with a Lightning backend because the operator controls the invoice claim and outgoing payout.
 
+> **Alternative subtype:** For the non-custodial `lightning_hold_invoice` construction where the agent owns the preimage and hold invoice and the arbiter publishes decisions only, see [`IMPL_GUIDE_LIGHTNING_HOLD_INVOICE.md`](IMPL_GUIDE_LIGHTNING_HOLD_INVOICE.md). That guide is the canonical reference for the `lightning_hold_invoice` PIP-01 subtype; this guide describes the primary `custodial_escrow` construction.
+
 **Normal path:** The customer funds the escrow node's hold invoice; after release authorization, the node settles it and pays the agent's separate payout invoice.
 **Dispute path:** Either party raises a dispute. An authorized solver selects release or refund, and the escrow node executes that outcome through LND.
 
