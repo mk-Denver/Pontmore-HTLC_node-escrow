@@ -1,537 +1,742 @@
 # Pontmore HTLC Escrow — Implementation Guide
 
-A step-by-step guide to building a Pontmore-compatible, Nostr-coordinated, node-controlled Lightning hold-invoice escrow. Under PIP-01 this is `custodial_escrow` with a Lightning backend because the operator controls the invoice claim and outgoing payout.
+**Building a Pontmore-compatible Lightning escrow service with LDK, Nostr coordination, and explicit economic authorization.**
 
-> **Alternative subtype:** For the non-custodial `lightning_hold_invoice` construction where the agent owns the preimage and hold invoice and the arbiter publishes decisions only, see [`IMPL_GUIDE_LIGHTNING_HOLD_INVOICE.md`](IMPL_GUIDE_LIGHTNING_HOLD_INVOICE.md). That guide is the canonical reference for the `lightning_hold_invoice` PIP-01 subtype; this guide describes the primary `custodial_escrow` construction.
+This guide describes the implementation of a node-controlled Lightning escrow service for Pontmore peer-to-peer Bitcoin/fiat swaps.
 
-**Normal path:** The customer funds the escrow node's hold invoice; after release authorization, the node settles it and pays the agent's separate payout invoice.
-**Dispute path:** Either party raises a dispute. An authorized solver selects release or refund, and the escrow node executes that outcome through LND.
+The architecture separates three systems:
 
-The canonical [Pontmore protocol repository](https://github.com/pontmore/protocol) is the source of truth. PIP-01 defines descriptor-level compatibility, PIP-02 defines the public event grammar, and PIP-03 defines the dispute and timeout policy boundary. Hold-invoice RPCs, authentication, payloads, errors, state names, and authorization rules are implementation behavior that MUST be defined in the OpenAPI or AsyncAPI document referenced by the PIP-01 descriptor.
+* **Pontmore protocol:** Defines identities, escrow discovery, coordination history, authorization, and dispute policy.
+* **LDK-based Lightning node:** Manages Lightning payments, HTLCs, and the underlying payment lifecycle.
+* **Pontmore escrow daemon:** Validates authorization, executes permitted operations, persists execution intent, and reconciles external payment outcomes.
 
-Canonical role mapping:
+The initial implementation targets PIP-01 `custodial_escrow` with a Lightning backend, subject to validating that the selected LDK implementation supports the required hold-invoice construction.
 
-| Protocol role | UI alias | Responsibility |
-|---------------|----------|----------------|
-| `agent` | seller | Provides the traded claim and a payout invoice |
-| `customer` | buyer | Requests the swap and funds the hold invoice |
-| escrow operator | node | Creates, monitors, settles, or cancels the hold invoice |
-| solver | arbiter | Reviews evidence and signs a release/refund directive |
+The escrow operator controls the settlement capability. Trading participants do not receive the escrow preimage or direct access to the node's settlement credentials.
 
-Public fields such as `agent`, `customer`, and `actor_role` use the protocol names. Buyer and seller are only explanatory aliases in this guide.
+This is an experimental proof of concept, not a trustless escrow construction.
 
----
+> **Protocol source of truth:** The canonical [Pontmore protocol repository](https://github.com/pontmore/protocol) and the exact specification versions pinned by a swap are authoritative. This guide describes implementation behavior and does not override a PIP or a referenced service schema.
 
-## 1. Environment setup
-
-### Dependencies
-
-- Node.js ≥ 20 or Rust ≥ 1.75
-- **Escrow operator** must run LND with hold-invoice, payment, and reconciliation support
-- **Customer** needs a Lightning wallet capable of paying invoices
-- **Agent** needs a wallet capable of creating a payout invoice
-- **Solver** needs a Nostr key and no direct Lightning credentials
-- Access to Nostr relays (at least one writable relay)
-
-### Role requirements
-
-| Role    | Lightning node | Hold-invoice | HTLC monitoring | Nostr keypair |
-|---------|---------------|--------------|-----------------|---------------|
-| Agent   | wallet only   | payout only  | n/a             | required      |
-| Customer| wallet only   | n/a          | n/a             | required      |
-| Operator| required      | must create  | must monitor    | required      |
-| Solver  | none required | n/a          | n/a             | required      |
-
-The escrow node owns the hold invoice and preimage and therefore enforces outcomes against both trading parties. Solver keys authorize policy decisions but have no LND credentials. This separation limits solver compromise, but the node operator remains trusted because it can access both the preimage and payment RPCs.
+> **Alternative subtype:** An agent-controlled `lightning_hold_invoice` construction is a separate security model. It must have its own descriptor, service schema, authorization rules, and recovery semantics. Do not advertise the operator-controlled implementation as participant-controlled merely because it uses a Lightning hold invoice.
 
 ---
 
-## 2. Nostr identity and relay layer
+## 1. Architecture and responsibilities
 
-### 2.1 Keypair management
+```text
+Customer                         Agent
+   │                               │
+   │ Pays funding invoice          │ Provides payout invoice
+   ▼                               ▼
+┌───────────────────────────────────────────┐
+│          Pontmore Escrow Daemon           │
+│                                           │
+│  Authorization · State validation         │
+│  Durable execution · Recovery             │
+│  Payment reconciliation                   │
+└─────────────────────┬─────────────────────┘
+                      │
+                      ▼
+┌───────────────────────────────────────────┐
+│             LDK-based Node                │
+│                                           │
+│  Lightning payments · HTLC lifecycle      │
+│  Channel and chain monitoring             │
+└─────────────────────┬─────────────────────┘
+                      │
+                      ▼
+               Lightning Network
 
-Each customer, agent, operator, and solver generates or loads a Nostr keypair appropriate to its role.
+Nostr coordination:
+  PIP-01 descriptor → PIP-02 action chain → pinned swap profile
+                                           → PIP-03 dispute policy
+```
 
-**Agent nsec** is used for:
-- Signing PIP-02 transition, evidence, and note events
-- NIP-44 encryption for submitting payout instructions and private evidence
-- Gift Wrap encapsulation for private payloads
+### Component responsibilities
 
-**Customer nsec** is used for:
-- Signing the PIP-02 swap request and relevant transition, evidence, and dispute events
-- NIP-44 decryption of the Gift Wrap invoice
-- Signing dispute events if needed
+| Component              | Responsibility                                                                                          |
+| ---------------------- | ------------------------------------------------------------------------------------------------------- |
+| LDK node               | Executes supported Lightning operations and reports payment state.                                      |
+| Escrow daemon          | Enforces the service's authorization policy and manages execution.                                      |
+| Authorization engine   | Validates the actor, action, profile, deadlines, and predecessor state.                                 |
+| Coordination validator | Validates the PIP-02 root and action chain.                                                             |
+| Nostr publisher        | Signs and publishes permitted coordination events.                                                      |
+| Private messaging      | Transports invoices, payment instructions, and sensitive evidence.                                      |
+| Persistent storage     | Stores execution intent, payment identifiers, authorization references, and reconciliation checkpoints. |
+| Recovery worker        | Reconciles actual Lightning state after timeouts, failures, and restarts.                               |
+| Resolver/solver        | Reviews disputes and publishes an authorized resolution; receives no Lightning credentials.             |
 
-**Escrow operator nsec** is used for:
-- Signing the k30361 escrow descriptor
-- Signing execution transitions, evidence, and snapshots
-
-**Solver nsec** is used for:
-- Taking an assigned dispute
-- Signing release or refund authorization transitions
-- Signing minimal public resolution notes
-- NIP-44 decryption of Gift Wrap evidence payloads
-
-Never expose nsec in plaintext on disk.
-
-### 2.2 Relay subscriptions
-
-Each participant maintains persistent WebSocket connections to at least one writable relay.
-
-**Agent subscribes to:**
-- Swap request events (`kind 7300`) addressed to the agent
-- Transition, evidence, dispute, and note events (`7301` through `7304`) correlated with active swap IDs
-- Gift Wrap events addressed to the agent's npub
-
-**Customer subscribes to:**
-- Transition, evidence, dispute, and note events (`7301` through `7304`) correlated with the swap ID
-- Optional snapshots (`kind 30362`) for fast lookup, verified against immutable history
-- Gift Wrap events addressed to the customer's npub, including the BOLT 11 invoice
-
-**Escrow operator subscribes to:**
-- Swap requests (`kind 7300`) that reference its descriptor
-- Disputes (`kind 7303`) addressed to its npub and related transition/evidence history
-- Gift Wrap events addressed to its npub, including sensitive evidence payloads
-
-### 2.3 NIP-44 encryption
-
-Private payloads use a maintained NIP-44 implementation from the selected Nostr library. Implementations MUST NOT replace NIP-44 with the simplified ECDH/encryption sketch previously shown here; key derivation, padding, nonce handling, versioning, and authentication must follow the NIP exactly.
-
-### 2.4 Gift Wrap (private execution lane)
-
-Private payloads — BOLT 11 invoice strings, delivery proofs, dispute evidence — travel through the Gift Wrap lane. These are NIP-44 encrypted messages sealed inside wrapper events.
-
-Public PIP-02 events carry the request and append-only lifecycle history. The private lane transports non-public payloads and is supplementary: it never overrides the public request, transition, evidence, dispute, note, or snapshot history.
+The daemon coordinates the protocol and execution. It must not treat a published Nostr event as proof that a Lightning payment has succeeded.
 
 ---
 
-## 3. Swap request protocol
+## 2. Protocol dependencies
 
-### 3.0 Escrow descriptor prerequisite
+The implementation depends on the following protocol layers.
 
-Before accepting requests, the escrow operator publishes an addressable PIP-01 descriptor (`kind 30361`) with a stable `d` tag. A minimum descriptor for this implementation is:
+| Specification                      | Purpose                                                                            |
+| ---------------------------------- | ---------------------------------------------------------------------------------- |
+| PIP-00 — Agent Definition          | Advertises agent identity, capabilities, and trading terms.                        |
+| PIP-01 — Escrow Descriptor         | Advertises the escrow type, network, and service schema.                           |
+| PIP-02 — Coordination Event Chains | Defines the coordination root, linked actions, authority, and chain validation.    |
+| PIP-03 — Dispute Policy            | Defines dispute and timeout policy constraints.                                    |
+| Pinned swap profile                | Defines swap-specific terms, actions, and authorization conditions.                |
+| Referenced service schema          | Defines the concrete escrow API, authentication, execution, and recovery behavior. |
+
+The implementation must pin supported specification and profile versions. It must reject unsupported versions rather than silently translate them into an assumed state machine.
+
+### PIP-02 event model
+
+The current generalized PIP-02 draft uses:
+
+* Kind `7300` for the immutable coordination root.
+* Kind `7301` for append-only coordination actions.
+
+Kernel actions such as `core/accept`, `core/secure`, `core/authorize_settlement`, `core/settle`, `core/authorize_refund`, `core/refund`, and `core/resolve_dispute` are action values, not separate event kinds.
+
+Swap-specific actions, including `swap/fiat_sent` and `swap/fiat_confirmed`, must be interpreted according to the pinned swap profile.
+
+Do not assume that dispute, evidence, or note event kinds from an earlier profile are part of the current canonical kernel. Use the exact event grammar of the pinned specifications.
+
+---
+
+## 3. Roles and trust model
+
+| Protocol role             | UI alias        | Responsibility                                  |
+| ------------------------- | --------------- | ----------------------------------------------- |
+| `customer`                | Buyer           | Requests the swap and funds the escrow.         |
+| `agent`                   | Seller          | Provides the traded claim and a payout invoice. |
+| `core/escrow` authority   | Escrow operator | Executes authorized economic outcomes.          |
+| `core/resolver` authority | Resolver/solver | Issues a permitted dispute-resolution effect.   |
+
+The public protocol uses canonical role names. Buyer and seller are explanatory UI aliases only.
+
+### Trust assumptions
+
+The operator-controlled design assumes that:
+
+1. The escrow service securely manages the settlement capability.
+2. The authorization engine validates the complete action chain.
+3. The execution service checks authorization before invoking Lightning operations.
+4. The recovery worker reports verified external outcomes rather than inventing economic authorization.
+5. The resolver does not have direct access to the settlement secret or Lightning credentials.
+
+These controls constrain the intended behavior of an honest implementation. They do not cryptographically prevent a malicious operator with sufficient node access from violating policy.
+
+---
+
+## 4. Environment setup
+
+### 4.1 Recommended implementation stack
+
+* Rust with a pinned, compatible LDK release.
+* LDK components or LDK Node, depending on the required API surface.
+* Bitcoin Core regtest for development.
+* A maintained Nostr library for event validation, signing, and encryption.
+* SQLite for a single-node prototype, or PostgreSQL for a multi-process service.
+* A maintained secret-management solution for preimages and signing keys.
+* A local Nostr relay for integration testing.
+
+### 4.2 Node capabilities
+
+Before implementing the escrow service, establish that the selected Lightning stack can safely support the intended payment construction.
+
+The required capabilities include:
+
+* Creating or supporting the required incoming hold-invoice construction.
+* Observing pending HTLCs and accepted payments.
+* Withholding claim until the application authorizes it.
+* Claiming or failing a held payment using the supported API.
+* Persisting and recovering payment state across restarts.
+* Tracking outgoing payout payments independently.
+* Handling payment expiry, partial payments where supported, and ambiguous operation results.
+
+**Do not assume that LDK's ordinary invoice or inbound-payment APIs automatically provide a complete Mostro-style hold-invoice workflow.**
+
+If the selected LDK stack cannot support the required behavior, implement and review the missing functionality at the appropriate layer or select a different backend for the initial prototype. Do not claim the escrow subtype is operational until the required behavior is demonstrated.
+
+### 4.3 Development environment
+
+Start with:
+
+1. Bitcoin Core in regtest mode.
+2. An LDK-based node with persistent storage.
+3. A customer wallet or test node.
+4. An agent wallet or test node.
+5. A local Nostr relay.
+6. Separate customer, agent, escrow, and resolver signing keys.
+7. A test database and encrypted secret store.
+
+The first milestone is proving the Lightning payment lifecycle, not building the full user interface.
+
+---
+
+## 5. Nostr identity and private messaging
+
+### 5.1 Key separation
+
+Use separate identities or explicitly separated signing roles for the customer, agent, escrow authority, and resolver.
+
+Each role signs only the events permitted by the pinned protocol and profile.
+
+* Customer: publishes the coordination root and permitted participant actions.
+* Agent: accepts or declines and publishes permitted participant actions.
+* Escrow authority: publishes escrow-authorized security and economic outcomes.
+* Resolver: publishes a permitted dispute-resolution effect when authorized.
+
+A resolver's key must not be treated as a Lightning execution credential.
+
+Never store an `nsec` in plaintext configuration, source code, logs, or public repositories. Prefer encrypted key storage or a suitable signing service.
+
+### 5.2 Relay subscriptions
+
+The application subscribes to the event kinds and filters defined by its pinned PIP versions.
+
+At minimum, the implementation needs to discover:
+
+* Coordination roots referencing its escrow descriptor.
+* Linked actions associated with active swaps.
+* The relevant agent definition and escrow descriptor.
+* Private messages addressed to the service.
+* Dispute and resolution information required by the selected profile.
+
+Do not subscribe to arbitrary events and treat their content as trusted commands. Validate signatures, event references, role authorization, profile versions, and predecessor linkage.
+
+### 5.3 Private payloads
+
+Private payloads may include:
+
+* Funding invoices.
+* Agent payout invoices.
+* Fiat payment instructions.
+* Delivery proofs.
+* Dispute evidence.
+* Internal references needed for execution.
+
+Use a maintained Nostr implementation of NIP-44 and Gift Wrap where required by the chosen private messaging design.
+
+Private messages supplement the public coordination chain; they do not override it. A private message must not independently authorize a settlement or refund.
+
+Never place preimages, node credentials, raw private evidence, or payment secrets in public coordination events.
+
+---
+
+## 6. Publish the PIP-01 escrow descriptor
+
+Before accepting swaps, the operator publishes a kind `30361` escrow descriptor.
+
+The descriptor must identify the actual escrow subtype and reference the corresponding versioned service schema.
+
+For the operator-controlled implementation, the intended declaration is:
 
 ```json
 {
-  "kind": 30361,
-  "tags": [
-    ["d", "lightning-custodial-escrow-v1"],
-    ["network", "lightning"]
-  ],
-  "content": "{\"version\":1,\"escrow_type\":\"custodial_escrow\",\"networks\":[\"lightning\"],\"funding_rules\":{\"funding_threshold\":1,\"participant_count\":1},\"dispute_rules\":{\"policy\":\"pip03\"},\"reference_format\":\"bolt11_or_custodial_escrow_reference\",\"service\":{\"schema\":{\"type\":\"openapi\",\"url\":\"https://escrow.example.com/pontmore-lightning-custodial-v1.openapi.json\"}},\"updated_at\":1724000000}",
-  "created_at": 1724000000
+  "version": 1,
+  "escrow_type": "custodial_escrow",
+  "networks": ["lightning"],
+  "service": {
+    "schema": {
+      "type": "openapi",
+      "url": "https://escrow.example.com/schemas/ldk-custodial-v1.json"
+    }
+  },
+  "expires_at": 1780000000
 }
 ```
 
-The repeated `network` tag is a discovery index; `content.networks` is canonical. `funding_threshold: 1` and `participant_count: 1` mean one declared participant must fund the escrow. They do not grant settlement authority. The schema URL must use HTTPS, avoid private or unsafe destinations, and should identify an immutable or versioned artifact. Clients must apply bounded fetches, redirect limits, content-type checks, and response-size limits before trusting it.
+This is illustrative content, not a complete or deployed descriptor. The actual event must include every field and tag required by the selected PIP-01 revision.
 
-### 3.1 Request structure
+### Descriptor validation
 
-The root is an immutable PIP-02 swap request event (`kind 7300`). Its content includes all required canonical fields:
+The descriptor publisher must:
 
-```json
-{
-  "kind": 7300,
-  "tags": [
-    ["p", "<agent_npub>"],
-    ["a", "30361:<operator_npub>:<descriptor_d_tag>"]
-  ],
-  "content": "{\"version\":1,\"swap_id\":\"...\",\"swap_type\":\"...\",\"agent\":\"...\",\"customer\":\"...\",\"escrow_reference\":\"...\",\"fiat\":{...},\"bitcoin\":{...},\"expiry\":1724000000}",
-  "created_at": 1724000000
-}
-```
+1. Use the correct addressable-event structure and stable `d` tag.
+2. Declare the correct escrow type and network.
+3. Reference an actual, versioned OpenAPI or AsyncAPI schema.
+4. Publish the corresponding discovery tags required by PIP-01.
+5. Ensure the schema URL uses HTTPS and is safe to retrieve.
+6. Avoid private or unsafe destinations, unbounded redirects, and oversized responses.
+7. Ensure the schema's service operations match the implementation.
+8. Keep the descriptor current and publish a replacement according to PIP-01's rules when its contents change.
 
-`escrow_reference` binds the request to the selected kind `30361` descriptor or escrow claim using the descriptor's declared `reference_format`. The exact `fiat`, `bitcoin`, and private execution payloads must follow the selected implementation's service schema. Raw invoices, preimages, wallet identifiers, and internal credentials stay out of public events.
+The descriptor advertises compatibility. It does not prove that the service is solvent, available, secure, or trustworthy.
 
-### 3.2 Request and acceptance flow
+### Funding cardinality is not spending authority
 
-1. Customer and agent negotiate terms through a declared channel.
-2. Customer creates and publishes the immutable `kind 7300` request.
-3. Agent validates the referenced current agent definition (`kind 30360`), escrow descriptor (`kind 30361`), and service schema.
-4. Agent accepts or rejects with a `kind 7301` transition containing `swap_id`, `state`, `prev_state`, `actor_role`, `reason`, and `created_at`.
-5. Escrow operator observes the request and transition log for possible dispute tracking.
+If the selected descriptor version uses `funding_rules`, the fields describe the funding conditions defined by that specification.
 
-A normal Nostr event has one author and one signature. This implementation therefore MUST NOT describe a request as "doubly signed." Multi-party consent is represented by separate signed, linked events in the append-only history.
+A field such as `funding_threshold` must not be interpreted as a spending threshold, preimage threshold, resolver quorum, or settlement authorization policy unless the applicable PIP explicitly defines that meaning.
 
 ---
 
-## 4. Node-controlled Lightning escrow
+## 7. Create and validate the coordination root
 
-### 4.1 Hold invoice creation (escrow node)
+The customer creates the immutable PIP-02 coordination root with the required canonical fields.
 
-The escrow node creates and controls the incoming hold invoice. Neither customer nor agent receives its preimage.
+The root must bind:
 
-1. Generate `p ← CSPRNG(32 bytes)` — the payment preimage.
-2. Compute `H = SHA256(p)`.
-3. Create a hold invoice with `hash = H`, the requested amount, an invoice expiry, and a final CLTV delta that satisfy the referenced service schema. Record the actual accepted HTLC expiry height separately when payment arrives.
+* Swap identifier and swap type.
+* Customer and agent identities.
+* Exact escrow descriptor revision.
+* Escrow authority.
+* Resolver authority when required.
+* Pinned profile and supported versions.
+* Agreed swap terms.
+* Relevant expiry and policy references.
 
-**LND (gRPC):**
-```
-lncli addholdinvoice --hash=<hex(H)> --amt=<amount_msat>m --memo="Pontmore swap <id>" --cltv_expiry=<htlc_expiry_blocks>
-```
+The exact content and tags must match the selected PIP-02 and profile schemas.
 
-**Core Lightning:** No standard RPC equivalent to LND's `addholdinvoice` is assumed by this guide. A deployment claiming CLN support MUST provide and test a dedicated hold-invoice plugin, document its `htlc_accepted` handling in the referenced service schema, and ensure it safely handles MPP, retries, restart recovery, cancellation, and expiry. The standard `invoice` RPC is not a substitute.
+### Request and acceptance flow
 
-4. Encrypt and durably store `swap_id → (payment_hash, preimage, bolt11_invoice, amount_msat, state)`.
-5. Deliver the BOLT 11 invoice string to the customer through the private lane.
-6. Publish an `INVOICED` `kind 7301` transition.
-7. Begin monitoring for HTLC arrival.
+1. Customer and agent negotiate the terms.
+2. Customer publishes the coordination root.
+3. The agent validates the root, agent definition, escrow descriptor, and referenced service schema.
+4. The agent publishes a permitted acceptance or decline action.
+5. The escrow service validates the linked action chain.
+6. Private payment details are exchanged through the declared private channel.
 
-The preimage `p` never leaves the escrow execution service. It is not available to trading parties, solvers, logs, public events, or general application workers.
+A Nostr event has one author and one event signature. Do not describe a single request as doubly signed. Separate signed actions express consent by different participants.
 
-### 4.2 HTLC monitoring (escrow node)
-
-**LND:** Subscribe to `SubscribeInvoices` gRPC stream. Watch for `state = ACCEPTED`.
-
-**CLN:** Use the deployment's declared and tested hold-invoice plugin; do not defer arbitrary HTLCs with an incomplete hook implementation.
-
-On HTLC arrival:
-1. Match the `payment_hash` to a swap ID.
-2. After the complete expected payment is accepted, publish a `FUNDED` `kind 7301` transition. For MPP, no partial shard set is `FUNDED`.
-3. Optionally publish a reference-style funding proof as `kind 7302`; do not expose a raw invoice or private routing data.
-4. Begin normal-path evaluation or wait for dispute.
-
-### 4.3 Agent payout instruction
-
-Before release, the agent sends a BOLT 11 payout invoice through the private lane. The node validates:
-
-- destination and network policy
-- exact expected payout amount after declared fees
-- invoice expiry and remaining execution window
-- uniqueness and binding to `swap_id`
-- payment hash has not been used for another payout
-
-The raw payout invoice remains private. A public `kind 7302` event may contain only an opaque reference or hash.
-
-### 4.4 Normal path — release (escrow node)
-
-When the delivery condition is met (delivery confirmed by buyer or external oracle):
-
-1. Validate the required release authorization and atomically persist an idempotent execution record.
-2. Call `settle(preimage)` on the incoming hold invoice.
-3. Mark the incoming payment `SETTLED` after LND reconciliation.
-4. Pay the agent's validated payout invoice.
-5. Publish `PAYOUT_PENDING` while payment is unresolved and `SETTLED` only after payout succeeds.
-6. Retry safely or request a replacement invoice according to the service schema.
-
-### 4.5 Normal path — refund (escrow node)
-
-When the refund condition is met (timeout, mutual agreement):
-
-1. Validate refund authorization or the declared timeout fallback.
-2. Call `cancelinvoice` on the incoming hold invoice.
-3. Reconcile the confirmed Lightning result and publish a `REFUNDED` `kind 7301` transition.
-4. HTLC funds return to the customer.
-
-### 4.6 Hold vs standard invoices
-
-Hold invoices are required. A standard invoice auto-settles on HTLC arrival, removing the node's ability to refund. With a hold invoice:
-- The customer's HTLC arrives at the escrow node.
-- Only the escrow execution service can `settle(preimage)` or `cancelinvoice`.
-- The node must execute before the HTLC's CLTV expiry; after expiry the HTLC auto-fails and funds return to the customer.
-- The dispute window must fit within the CLTV window.
+The escrow daemon must reject requests that reference an expired descriptor, unsupported profile, untrusted authority, invalid predecessor, or incompatible service schema.
 
 ---
 
-## 5. Swap state machine (PIP-02)
+## 8. HTLC funding lifecycle
 
-### 5.1 States
+### 8.1 Funding feasibility gate
 
-```
-REQUESTED           → immutable kind 7300 request exists
-ACCEPTED            → agent accepted the request
-INVOICED            → hold invoice delivered privately
-FUNDED              → complete HTLC payment accepted by the escrow node
-DISPUTED            → kind 7303 dispute opened; arbiter reviewing
-RELEASE_AUTHORIZED  → release authorized under normal or dispute policy
-REFUND_AUTHORIZED   → refund authorized under timeout or dispute policy
-PAYOUT_PENDING      → incoming HTLC settled; agent payout not yet confirmed
-SETTLED             → incoming settlement and agent payout confirmed
-REFUNDED            → Lightning cancellation or expiry confirmed
-EXPIRED             → request expired before funding
-```
+Before building the production lifecycle, implement a minimal regtest experiment that answers:
 
-### 5.2 State transitions
+1. Can the selected LDK stack create or support the intended hold invoice?
+2. Can the incoming payment remain pending until explicit application authorization?
+3. Can the service securely retain the settlement capability?
+4. Can it claim or fail the payment using supported APIs?
+5. Can it recover payment state after a process crash?
+6. Can it handle the payment's actual HTLC expiry safely?
 
-```
-REQUESTED ──→ ACCEPTED ──→ INVOICED ──→ FUNDED
-   │                                      ├──→ RELEASE_AUTHORIZED ──→ PAYOUT_PENDING ──→ SETTLED
-   ▼                                      ├──→ REFUND_AUTHORIZED  ──→ REFUNDED
-EXPIRED                                   └──→ DISPUTED
-                                                    ├──→ RELEASE_AUTHORIZED ──→ PAYOUT_PENDING ──→ SETTLED
-                                                    └──→ REFUND_AUTHORIZED  ──→ REFUNDED
-```
+If any answer is unknown, keep the implementation in the feasibility stage.
 
-Each state change is an immutable PIP-02 transition event (`kind 7301`) with coherent `state`, `prev_state`, and `actor_role`. The request (`7300`), transition log (`7301`), evidence references (`7302`), dispute (`7303`), and notes (`7304`) are append-only. A replaceable snapshot (`30362`) is only a fast lookup optimization; immutable history is authoritative.
+### 8.2 Invoice creation
 
-These state names are this subtype's service behavior, not canonical PIP-02 states. They MUST be enumerated in the referenced service schema together with permitted actors and transitions.
+Once the required construction has been validated:
 
-### 5.3 HTLC expiry fallback
+1. Generate the payment preimage using a cryptographically secure random-number generator if the selected construction requires an application-generated preimage.
+2. Compute the corresponding payment hash.
+3. Create the hold invoice or payment condition using the selected backend's supported API.
+4. Persist the invoice reference, payment hash, expected amount, expiry information, and encrypted preimage where applicable.
+5. Deliver the invoice privately to the customer.
+6. Record the internal funding state.
+7. Publish the relevant profile-defined coordination action.
 
-If the actual accepted HTLC expires before any resolution:
-- Lightning auto-fails the HTLC, funds return to the customer.
-- Publish a `REFUNDED` transition after reconciling the Lightning result. `EXPIRED` is reserved for a request that expired before funding.
-- If a dispute was pending, the operator may publish a `kind 7304` note explaining that the payment timed out, but must not imply that a later resolution moved funds.
+The exact invoice-generation procedure is backend-specific. Do not copy LND-specific RPC commands into an LDK implementation and assume equivalent semantics.
 
----
+### 8.3 Observe incoming payment
 
-## 6. Dispute resolution (arbiter side)
+The daemon subscribes to or polls the supported LDK payment events and reconciles them with durable storage.
 
-### 6.1 Dispute initiation
+When a payment becomes pending:
 
-Either party publishes a PIP-02 dispute event (`kind 7303`) and a coherent transition to `DISPUTED`:
+1. Match it to the correct escrow instance and payment hash.
+2. Validate the expected amount and funding conditions.
+3. Verify that the observed state is consistent with the underlying payment construction.
+4. For multipart payments, verify the required complete funding condition rather than treating a partial shard as a fully funded escrow.
+5. Persist the observed payment state.
+6. Publish `core/secure` only when the pinned profile's security condition has been satisfied.
 
-```json
-{
-  "kind": 7303,
-  "tags": [
-    ["e", "<swap_request_event_id>", "<relay_hint>"],
-    ["p", "<arbiter_npub>"]
-  ],
-  "content": "{\"version\":1,\"swap_id\":\"...\",\"dispute_class\":\"...\",\"reason\":\"...\"}",
-  "created_at": ...
-}
-```
+Invoice creation, invoice delivery, and partial payment observation do not prove that escrow funding is complete.
 
-Any dispute fee and proof format are implementation-specific and must be declared by the referenced service schema. Clients must not infer a keysend fee requirement from PIP-03 itself.
-
-### 6.2 Evidence submission
-
-Both parties submit evidence via Gift Wrap to the arbiter:
-- Delivery proofs, screenshots, tracking information
-- Signed messages, timestamps
-- Any mutually agreed oracle attestations
-
-Evidence is encrypted to the arbiter's npub and delivered through the Gift Wrap lane.
-
-### 6.3 Arbiter review
-
-The arbiter:
-1. Receives the `DISPUTED` event.
-2. Collects evidence from both parties via Gift Wrap.
-3. Evaluates the request, append-only history, private terms, and evidence under the declared policy.
-4. Publishes a signed `kind 7301` authorization transition to `RELEASE_AUTHORIZED` or `REFUND_AUTHORIZED`.
-5. Optionally publishes a `kind 7304` public note with the minimum reasoning necessary.
-
-```json
-{
-  "kind": 7301,
-  "tags": [
-    ["e", "<swap_request_event_id>", "<relay_hint>"],
-    ["e", "<dispute_event_id>", "<relay_hint>"],
-    ["p", "<buyer_npub>"],
-    ["p", "<seller_npub>"]
-  ],
-  "content": "{\"swap_id\":\"...\",\"state\":\"RELEASE_AUTHORIZED\",\"prev_state\":\"DISPUTED\",\"actor_role\":\"escrow_operator\",\"reason\":\"customer_claim_confirmed\",\"created_at\":1724000000}",
-  "created_at": 1724000000
-}
-```
-
-The arbiter signs the Nostr event with their nsec. The normal event signature authenticates the transition; do not duplicate a signature inside `content`.
-
-### 6.4 Decision enforcement
-
-The escrow service verifies the solver assignment, write permission, event signature, current state, and idempotency key before execution:
-
-- **RELEASE_AUTHORIZED** → node settles the incoming hold invoice, enters `PAYOUT_PENDING`, pays the agent invoice, and publishes `SETTLED` after reconciliation
-- **REFUND_AUTHORIZED** → node cancels the incoming hold invoice and publishes `REFUNDED` after reconciliation
-
-Neither party can override the decision because neither party has the preimage or LND credentials. The operator can still violate policy or fail, so this is operator-controlled enforcement rather than trustless three-party cryptography.
-
-### 6.5 Dispute window enforcement
-
-The solver and escrow node MUST resolve and execute before the deadline derived from the actual accepted HTLC expiry height. The implementation should:
-1. Track the request and dispute deadlines from the service schema and the accepted HTLC expiry height observed by the escrow execution service.
-2. Set an internal block-height deadline that preserves the declared execution and safety buffers.
-3. Bind the timeout to the explicit non-`mutual_consent` fallback declared by the descriptor or service schema, as PIP-03 requires.
-4. If the payment expires, reconcile it as `REFUNDED` and publish the corresponding transition.
-5. Alert both parties that the HTLC is approaching expiry.
+If the selected LDK implementation does not support the required multipart or hold-invoice behavior, reject or disable that mode rather than silently weakening the funding conditions.
 
 ---
 
-## 7. Escrow node and solver service
+## 9. Agent payout invoice
 
-### 7.1 Core loop
+The agent provides a Lightning payout invoice through the private channel.
 
-```
-while running:
-    ensure k30361 descriptor and service schema are published and up-to-date
-    accept PIP-02 request, transition, evidence, dispute, and note events
-    for each new swap request referencing this descriptor:
-        record swap for potential dispute tracking
-    for each dispute event:
-        notify arbiter operator
-        collect evidence from both parties
-        evaluate against swap conditions
-        if decision reached:
-            solver publishes signed RELEASE_AUTHORIZED or REFUND_AUTHORIZED transition
-            execution service validates and executes the directive through LND
-        if deadline approaching without decision:
-            execute the declared PIP-03 fallback and publish its transition
-```
+Before release, the daemon validates:
 
-The solver does **not** generate invoices, hold preimages, receive LND credentials, or call settlement RPCs. The escrow execution service performs those operations. Production deployments should isolate solver authorization from Lightning execution and require an authenticated, auditable directive between them.
+* Invoice network and destination policy.
+* Amount and fee treatment.
+* Invoice expiry and remaining execution window.
+* Binding to the correct swap.
+* Duplicate-use and replay protection.
+* Whether the invoice can be paid using the node's available liquidity.
+* Whether the payout operation is compatible with the declared service schema.
 
-### 7.2 Storage schema
+The payout invoice is private. Public evidence may contain a permitted opaque reference or commitment, but must not expose the raw invoice.
 
-```
-swaps:
-  id                  TEXT PRIMARY KEY
-  buyer_npub          TEXT NOT NULL
-  seller_npub         TEXT NOT NULL
-  amount_msat         INTEGER NOT NULL
-  payment_hash        TEXT                  # SHA256(preimage), bound by private execution data
-  preimage_ciphertext BLOB                  # encrypted; execution service only
-  payout_invoice_hash TEXT                  # private invoice commitment
-  invoice_expires_at  INTEGER               # BOLT 11 invoice expiry time
-  htlc_expiry_height  INTEGER               # actual accepted HTLC expiry height
-  dispute_deadline    INTEGER               # policy deadline
-  state               TEXT NOT NULL         # subtype state declared by the service schema
-  request_json        TEXT                  # immutable kind 7300 request
-  created_at          INTEGER NOT NULL
-  updated_at          INTEGER NOT NULL
-
-disputes:
-  id                  TEXT PRIMARY KEY
-  swap_id             TEXT REFERENCES swaps(id)
-  raised_by_npub      TEXT NOT NULL
-  reason              TEXT
-  evidence            TEXT                  # JSON array of evidence references
-  decision            TEXT                  # RELEASE_AUTHORIZED | REFUND_AUTHORIZED
-  decision_event_id   TEXT                  # Nostr event ID of resolution transition
-  created_at          INTEGER NOT NULL
-  resolved_at         INTEGER
-
-executions:
-  directive_event_id  TEXT PRIMARY KEY
-  swap_id             TEXT REFERENCES swaps(id)
-  operation           TEXT NOT NULL         # RELEASE | REFUND | PAYOUT
-  status              TEXT NOT NULL         # PENDING | SUBMITTED | CONFIRMED | FAILED
-  attempt_count       INTEGER NOT NULL
-  lightning_reference TEXT
-  last_error          TEXT
-  created_at          INTEGER NOT NULL
-  updated_at          INTEGER NOT NULL
-```
-
-### 7.3 Service endpoints
-
-| Method | Path                       | Description                         |
-|--------|----------------------------|-------------------------------------|
-| GET    | `/swap/:id`                | Get swap state                      |
-| POST   | `/swap/:id/dispute`        | Raise a dispute as either party     |
-| POST   | `/swap/:id/evidence`       | Submit authenticated evidence       |
-| GET    | `/swap/:id/decision`       | Get solver decision                 |
-| POST   | `/swap/:id/payout-invoice` | Submit/replace agent payout invoice |
-| GET    | `/swap/:id/execution`      | Get reconciled Lightning execution  |
-
-LND execution is not exposed as a general public endpoint. The execution worker consumes a durable directive only after validating the assigned solver, permission level, signature, expected `prev_state`, deadline, and idempotency key. If an internal `/execute` operation exists, it must be authenticated service-to-service and unavailable from the public listener.
+A valid payout invoice does not itself authorize release.
 
 ---
 
-## 8. Client integration
+## 10. Authorization and economic execution
 
-### 8.1 Buyer flow
+The execution service validates the current action chain and the authorization required by the pinned profile before performing an economic operation.
 
-1. Load Nostr keypair.
-2. Connect to relays and subscribe to the PIP-02 event kinds.
-3. Negotiate terms with seller.
-4. Publish the immutable kind 7300 request and wait for the agent's acceptance transition.
-5. Receive BOLT 11 hold invoice via Gift Wrap.
-6. Pay the invoice via Lightning.
-7. Wait for the `FUNDED` transition and validate its append-only history.
-8. Confirm delivery (if goods received).
-9. Wait for the `SETTLED` transition and corresponding Lightning reconciliation result.
+### 10.1 Normal release
 
-If delivery never arrives:
-1. Publish `DISPUTED` event before dispute window closes.
-2. Submit evidence to arbiter via Gift Wrap.
-3. Wait for the arbiter's `RELEASE_AUTHORIZED` or `REFUND_AUTHORIZED` transition.
-4. If refund is authorized, wait for the escrow node's reconciled `REFUNDED` transition.
+The normal release flow is:
 
-### 8.2 Agent flow
+1. The agent performs the agreed fiat-side obligation.
+2. The relevant participant publishes the profile-defined claim, such as `swap/fiat_sent`.
+3. Receipt is confirmed according to the pinned profile.
+4. The appropriate authority publishes `core/authorize_settlement`.
+5. The daemon validates the authorization and current chain tip.
+6. It durably records an idempotent execution intent.
+7. It invokes the supported Lightning claim or settlement operation.
+8. It reconciles the actual incoming payment result.
+9. It attempts the agent's outgoing payout.
+10. It publishes the final economic outcome only when the conditions defined by the service schema and profile are satisfied.
 
-1. Load the agent's Nostr keypair and Lightning wallet.
-2. Connect to relays.
-3. Validate the customer's request and publish an acceptance transition.
-4. Create a payout invoice for the exact expected amount and deliver it privately to the escrow node.
-5. Wait for the node's `INVOICED` and `FUNDED` transitions.
-6. Fulfil the traded obligation.
-7. Participate in normal release authorization or submit evidence during a dispute.
-8. Verify receipt of the outgoing payout; the agent never receives the escrow preimage.
+The actual LDK API call depends on the validated payment construction.
 
-### 8.3 Escrow operator and solver setup
+### 10.2 Two-leg settlement is not atomic
 
-1. Run LND with narrowly scoped invoice and payment credentials in the execution service.
-2. Store preimages encrypted under a vault or HSM-backed data key.
-3. Load separate operator and solver signing keys.
-4. Connect to relays and subscribe to requests and dispute history.
-5. Reconcile all nonterminal executions with LND after every restart.
+The incoming escrow settlement and outgoing agent payout are separate operations.
 
----
+The incoming payment may settle successfully while the payout remains pending or fails. The daemon must:
 
-## 9. Testing
+* Persist the incoming settlement result.
+* Record the outgoing payout's independent status.
+* Expose an internal `PAYOUT_PENDING` state where appropriate.
+* Retry only after reconciling the outgoing payment.
+* Prevent duplicate payouts.
+* Request a replacement invoice if the service schema permits it.
+* Avoid publishing a completed swap outcome prematurely.
 
-### 9.1 Unit tests
+A successful incoming claim does not prove that the agent received the payout.
 
-- Swap request signing and validation (wrong author, expiry, missing canonical fields, invalid escrow reference).
-- Transition authorization and `prev_state` coherence.
-- Hold-invoice creation (verify payment_hash matches SHA256(preimage)).
-- State machine transitions — reject invalid transitions (e.g., SETTLED → DISPUTED).
-- Dispute event signing and validation.
-- Arbiter resolution-transition signing, actor authorization, and signature verification.
-- NIP-44 encryption round-trip.
-- Gift Wrap encapsulation and decapsulation.
+### 10.3 Refund authorization
 
-### 9.2 Integration tests
+The daemon must validate the applicable authorization before initiating a refund.
 
-- **Regtest Lightning network.** Use Polar with an escrow LND node plus customer and agent wallets.
-- **Local Nostr relay.** nostr-rs-relay in Docker.
-- **Normal release path.** Request → acceptance → node hold invoice → customer HTLC → FUNDED → RELEASE_AUTHORIZED → node settles → PAYOUT_PENDING → node pays agent → SETTLED.
-- **Normal refund path.** Request → node hold invoice → customer HTLC → FUNDED → REFUND_AUTHORIZED → node cancels → REFUNDED.
-- **Dispute release.** FUNDED → kind 7303 dispute → DISPUTED → authorized solver release → node settles and pays agent.
-- **Dispute refund.** FUNDED → kind 7303 dispute → DISPUTED → authorized solver refund → node cancels the HTLC.
-- **Unauthorized solver.** Submit a validly signed resolution from an unassigned or read-only solver and verify no LND operation occurs.
-- **Payout failure after settlement.** Settle the incoming HTLC, fail the outgoing payment, verify `PAYOUT_PENDING`, durable retries, and no duplicate payment.
-- **HTLC expiry before dispute resolution.** Request → hold invoice with insufficient window → FUNDED → dispute raised too late → HTLC expires → REFUNDED.
-- **Conflicting events.** Publish transitions with incoherent `prev_state` values and verify clients reject them when materializing the append-only history.
-- **Snapshot disagreement.** Publish a stale or incorrect kind 30362 snapshot and verify clients prefer immutable request and transition history.
+Depending on the pinned profile, valid authorization may come from an explicit `core/authorize_refund` action or a valid dispute-resolution effect that authorizes a refund.
 
-### 9.3 Test harness
+A timeout, HTLC expiry, node restart, or external recovery condition is not automatically a Pontmore refund authorization.
 
-A scripted runner that:
-1. Spawns an escrow LND node and customer/agent regtest wallets.
-2. Starts a local Nostr relay.
-3. Creates keypairs for customer, agent, operator, and solver.
-4. Operator publishes the k30361 descriptor and service schema.
-5. Executes each scenario and asserts: state transitions, HTLC settle/cancel outcomes, arbiter decision signatures.
+If the payment has already failed or expired, the daemon records the verified external fact and follows the permitted recovery path. It must not fabricate a refund operation or publish a final economic outcome unsupported by the actual payment state.
+
+### 10.4 Cancellation
+
+Cancellation is distinct from refund.
+
+`core/cancel` must be used only under the circumstances permitted by the pinned protocol and profile. The daemon must distinguish a valid pre-economic cancellation from a refund of a secured escrow.
+
+Never map every timeout or payment failure to `core/cancel` or `core/refund` without checking the applicable authorization and current payment state.
 
 ---
 
-## 10. Deployment considerations
+## 11. Dispute resolution
 
-### 10.1 Security
+### 11.1 Opening a dispute
 
-- **nsec storage.** All keypairs encrypted at rest. Arbiters should use vaulted keys.
-- **Node preimage storage.** `preimage_p` encrypted at rest with a vault- or HSM-protected data encryption key.
-- **Lightning execution access.** The isolated execution service needs narrowly scoped invoice read/write and outgoing payment permissions. Solver and general API processes receive no macaroon.
-- **Payout safety.** Use durable idempotency, outgoing payment lookup by payment hash, compare-and-swap state changes, and restart reconciliation before retries.
-- **Dispute fee.** A small Lightning payment (keysend) should accompany dispute events to deter abuse.
+A participant opens a dispute through the action permitted by the pinned PIP-02 and profile.
 
-### 10.2 Operational
+The daemon validates:
 
-- **Deadline separation.** Keep request expiry, BOLT 11 invoice expiry, final CLTV delta, actual accepted HTLC expiry height, dispute deadline, and execution buffer as distinct values. Do not compare seconds directly with block deltas.
-- **Arbiter availability.** The arbiter must be online and responsive within the dispute window. SLAs should be defined.
-- **Monitoring.** Alert on: FUNDED swaps approaching dispute window end without resolution, arbiter decision deadline approaching, relay disconnections.
-- **Operator accountability.** Signed solver directives and node execution evidence make policy violations auditable, but cannot prevent a compromised operator from misusing its LND access.
+* The participant's identity and authority.
+* The root and current action-chain tip.
+* Whether a dispute may be opened at this stage.
+* The applicable dispute deadline.
+* The selected PIP-03 policy.
+* Any service-specific requirements.
 
-### 10.3 Trust model and future PTLC upgrade
+Once a valid dispute freezes ordinary progression, the daemon must not continue normal economic execution unless the protocol explicitly permits the relevant action.
 
-The node-controlled design enforces outcomes against both trading parties, but the operator remains trusted. A future non-custodial construction would require a separately specified and reviewed PTLC/adaptor-signature subtype:
+### 11.2 Evidence submission
 
-- Define a separate descriptor and service schema for a reviewed PTLC construction that requires the arbiter's adaptor signature.
-- The seller cannot settle unilaterally after a dispute is raised — the arbiter's adaptor is required.
-- The arbiter provides the adaptor to the winning party.
-- This is `settlement_enforcement: cryptographic`.
+The participants submit evidence through the profile-defined private channel.
 
-The PIP-02 event grammar and PIP-03 policy boundary may remain compatible, but custody, authorization, timeout, and settlement semantics must be accurately advertised through PIP-01 and the referenced service schema.
+Examples include:
+
+* Fiat payment receipts.
+* Delivery confirmations.
+* Signed messages.
+* Agreed oracle attestations.
+* Relevant timestamps and references.
+
+Evidence must be authenticated and bound to the correct swap. A screenshot or signed claim may support a decision but does not automatically prove the underlying fiat transaction occurred.
+
+Public events should expose only the minimum information required by the protocol.
+
+### 11.3 Resolver decision
+
+The resolver evaluates the evidence and publishes the permitted PIP-02 dispute-resolution action.
+
+Depending on the pinned PIP-02 revision, the resolution effect may authorize settlement, authorize refund, resume the permitted workflow, or cancel where allowed.
+
+The daemon must verify:
+
+1. Resolver identity and binding to the root.
+2. Signature and event validity.
+3. Action-chain predecessor and current state.
+4. Permitted resolution effect.
+5. Applicable deadline and profile rules.
+6. Idempotency and replay protection.
+
+A resolution effect is an authorization record, not a Lightning payment.
+
+The daemon executes the authorized operation through the Lightning backend, reconciles the actual result, and publishes the permitted final economic action only after the outcome is established.
+
+### 11.4 Solver/executor separation
+
+The resolver does not receive the preimage or Lightning credentials.
+
+The resolver signs a policy decision. The execution service independently validates that decision before acting.
+
+This limits the consequences of a compromised resolver key, but it does not eliminate the trust placed in the escrow operator.
+
+---
+
+## 12. Timeout policy and external custody reconciliation
+
+A hold-invoice HTLC has a finite lifetime. The implementation must not assume that a dispute can remain open indefinitely.
+
+The service schema and pinned profile must distinguish:
+
+* Coordination expiry.
+* Funding invoice validity.
+* Actual accepted HTLC expiry and relevant CLTV constraints.
+* Fiat-payment deadline.
+* Fiat-confirmation deadline.
+* Dispute-opening deadline.
+* Dispute-resolution deadline.
+* Execution and recovery safety buffer.
+
+Wall-clock seconds and block-height or CLTV values are different units. Do not compare them directly.
+
+### Recovery invariants
+
+The daemon must enforce these invariants:
+
+* External payment state does not itself authorize a Pontmore economic action.
+* HTLC expiry or failure does not independently authorize `core/refund`.
+* Absence of `swap/fiat_confirmed` is not proof that fiat was not received.
+* A timeout does not select a default winner unless the pinned profile explicitly defines the relevant authorization and recovery behavior.
+* A lost RPC response is not proof that an operation failed.
+* A daemon restart does not authorize replaying an economic operation.
+* An ambiguous payment state must be reconciled before final publication.
+* A fork or invalid action chain must freeze unsafe economic progression.
+
+If the HTLC expires and Lightning confirms the payment failed, the service records that fact and applies the valid recovery policy. It must not pretend that a refund authorization occurred if none was published.
+
+If a payment outcome cannot be determined, mark the execution for reconciliation and avoid publishing a false final state.
+
+---
+
+## 13. Persistent storage and idempotency
+
+The service must be resilient to crashes between authorization, execution, and publication.
+
+Persist at least:
+
+### Swap record
+
+* Swap ID and coordination root event ID.
+* Customer and agent identities.
+* Bound escrow authority and resolver.
+* Exact descriptor event ID and coordinate.
+* Pinned protocol and profile versions.
+* Amount and currency terms.
+* Funding invoice reference and payment hash.
+* Encrypted preimage, where required.
+* Actual accepted HTLC expiry information.
+* Current validated action-chain tip.
+* Current internal execution state.
+
+### Authorization record
+
+* Authorizing action event ID.
+* Action and permitted effect.
+* Authorized actor and authority binding.
+* Validated predecessor.
+* Applicable deadline.
+* Idempotency key.
+* Validation result.
+
+### Execution record
+
+* Swap ID and operation type.
+* Durable execution intent.
+* Incoming payment reference.
+* Outgoing payment reference.
+* Attempt count and status.
+* Last reconciled node state.
+* Last error and recovery checkpoint.
+* Final verified outcome, if any.
+
+Use transactions, compare-and-swap updates or equivalent concurrency controls to prevent competing workers from executing incompatible operations.
+
+Before retrying any Lightning operation, reconcile the actual node state. Never infer that an operation failed solely because a request timed out.
+
+The database is an execution journal. It does not override the validated public action chain or the actual Lightning state.
+
+---
+
+## 14. Service API
+
+The exact API must be defined in the versioned OpenAPI or AsyncAPI artifact referenced by the PIP-01 descriptor.
+
+A service may expose operations equivalent to:
+
+| Operation                | Purpose                                                              |
+| ------------------------ | -------------------------------------------------------------------- |
+| Create escrow            | Create a swap-bound escrow instance.                                 |
+| Get escrow status        | Retrieve the reconciled escrow state.                                |
+| Get funding instructions | Deliver a private funding invoice or supported alternative.          |
+| Submit payout invoice    | Register or replace the agent's payout invoice where permitted.      |
+| Submit evidence          | Submit authenticated evidence through the supported private channel. |
+| Get execution status     | Retrieve the reconciled incoming and outgoing payment states.        |
+| Request reconciliation   | Trigger an authenticated reconciliation of external payment state.   |
+
+The API must define authentication, authorization, error responses, idempotency, versioning, rate limits and privacy requirements.
+
+**Never expose a public endpoint that accepts an arbitrary payment hash and preimage or executes a raw settlement command.**
+
+The execution worker must consume a durable, validated directive. Internal node operations must be isolated from public API processes.
+
+---
+
+## 15. Testing
+
+### 15.1 Protocol tests
+
+* Valid and invalid root signatures.
+* Invalid descriptor references.
+* Unsupported protocol and profile versions.
+* Unauthorized actors.
+* Invalid predecessors and replayed actions.
+* Conflicting forks.
+* Duplicate authorizations.
+* Invalid resolver assignments.
+* Settlement without prior authorization.
+* Refund without prior authorization or a valid resolution effect.
+* Timeout with no valid economic authorization.
+* Snapshot disagreement with immutable history, where snapshots are supported.
+
+### 15.2 Lightning feasibility tests
+
+On regtest, prove:
+
+* The selected LDK stack supports the required hold-invoice construction.
+* A funding payment can remain pending as required.
+* The settlement secret matches the expected payment hash.
+* Claim and failure operations work as expected.
+* Payment expiry returns the expected external result.
+* Payment events and node state survive process restarts.
+* Unsupported payment modes fail safely.
+* Partial or multipart funding is handled according to the declared policy.
+
+### 15.3 Execution tests
+
+* Normal release after valid authorization.
+* Refund after valid authorization.
+* Unauthorized settlement attempt.
+* Unauthorized refund attempt.
+* Duplicate execution directive.
+* Incoming settlement succeeds but outgoing payout remains pending.
+* Outgoing payout fails and is safely retried.
+* RPC timeout with an unknown outcome.
+* Crash after persisting intent but before executing.
+* Crash after execution but before publishing the final action.
+* HTLC expiry during a dispute.
+* Dispute opened too late for safe resolution.
+* External payment failure without refund authorization.
+* Recovery after the daemon restarts.
+* Fork discovered while an execution is pending.
+
+### 15.4 End-to-end environment
+
+Use:
+
+* Bitcoin Core regtest.
+* The selected LDK node implementation.
+* Customer and agent test wallets.
+* A local Nostr relay.
+* Separate test identities for the customer, agent, escrow authority, and resolver.
+* A persistent database.
+* Automated assertions against both the public action chain and the actual Lightning payment state.
+
+A successful test must verify both protocol correctness and the external payment result. A final Nostr event alone is not proof that the funds moved as intended.
+
+---
+
+## 16. Security and deployment
+
+### Key and secret management
+
+* Encrypt Nostr signing keys at rest.
+* Encrypt the preimage where the selected construction requires the service to retain it.
+* Separate resolver signing credentials from Lightning execution credentials.
+* Keep node credentials out of the public API and general application workers.
+* Redact invoices, preimages, private evidence and credentials from logs.
+* Limit access to production secrets and audit sensitive operations.
+
+### Operational monitoring
+
+Alert on:
+
+* Pending HTLCs approaching their safety deadline.
+* Disputes approaching their resolution deadline.
+* Incoming settlement succeeded but payout remains pending.
+* Reconciliation failures.
+* Repeated or conflicting authorization attempts.
+* Nostr relay disconnections.
+* Database or secret-store failures.
+* Unexpected payment state transitions.
+* A mismatch between the public coordination chain and external payment state.
+
+### Operator accountability
+
+Signed actions and durable execution records make it possible to audit intended policy and reported outcomes. They do not prevent a malicious or compromised operator from using its Lightning credentials outside the protocol.
+
+### Production readiness
+
+Do not deploy with real-value trades until the implementation has:
+
+* Demonstrated the required hold-invoice behavior on regtest.
+* Validated the exact PIP and profile revisions it supports.
+* Published a complete service schema.
+* Passed authorization, failure, restart and reconciliation tests.
+* Undergone independent review of the Lightning construction and secret handling.
+* Documented the operator trust model and recovery limitations.
+
+---
+
+## 17. Future direction: stronger settlement enforcement
+
+The current design is operator-controlled. A future construction may investigate whether a supported and independently reviewed cryptographic payment mechanism can reduce unilateral settlement control.
+
+A PTLC or adaptor-signature proposal must define and prove:
+
+* Who can settle the payment.
+* Which secret or signature enables settlement.
+* What happens when the resolver disappears.
+* Whether either trading participant can settle unilaterally.
+* How disputes freeze or constrain economic progression.
+* How timeout and recovery operate.
+* Whether the required construction is supported by the selected Lightning implementation.
+
+Do not advertise a PTLC/adaptor-signature design as cryptographically enforced merely because it includes an adaptor signature or resolver key. The complete construction must establish the claimed security properties.
+
+Any future mechanism should advertise its distinct custody, authorization, timeout and recovery guarantees through a separate PIP-01 subtype and versioned service schema.
+
+---
+
+## 18. Implementation milestones
+
+1. **LDK feasibility:** Demonstrate the required held-payment lifecycle on regtest.
+2. **Lightning adapter:** Build a narrow interface for payment observation, claim/failure, payout tracking and reconciliation.
+3. **PIP-02 validator:** Validate signatures, root binding, linked actions, authority and supported versions.
+4. **PIP-01 service schema:** Publish the concrete service API and authorization contract.
+5. **Durable execution journal:** Persist intent before operations and reconcile after restarts.
+6. **Authorized release/refund:** Enforce authorization and verify external outcomes.
+7. **Dispute integration:** Validate resolver effects and execute only permitted outcomes.
+8. **Recovery testing:** Cover expiry, ambiguous results, crashes, forks and partial settlement.
+9. **Interoperability tests:** Publish shared test vectors for supported protocol and profile versions.
+10. **Independent review:** Review the Lightning construction, authorization boundaries, secret management and recovery behavior.
+
+## License
+
+MIT
