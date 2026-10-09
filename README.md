@@ -169,8 +169,8 @@ The public escrow descriptor is a kind `30361` addressable event. It declares th
 
 For this implementation, the intended declaration is:
 
-* `escrow_type`: `custodial_escrow`
-* `networks`: includes `lightning`
+* `escrow_type`: `lightning_hold_invoice`
+* `networks`: `lightning`
 * `service.schema.type`: `openapi` or `asyncapi`
 * `service.schema.url`: an immutable or versioned HTTPS schema artifact
 * `expires_at`: descriptor selection expiry
@@ -182,7 +182,7 @@ Illustrative descriptor content:
 ```json
 {
   "version": 1,
-  "escrow_type": "custodial_escrow",
+  "escrow_type": "lightning_hold_invoice",
   "networks": ["lightning"],
   "service": {
     "schema": {
@@ -205,12 +205,6 @@ The descriptor MUST NOT contain:
 * private evidence or internal reconciliation records.
 
 A descriptor does not prove that the service is online, solvent, safe, or trustworthy. Clients must validate the event signature, descriptor version, expiry, network compatibility, exact accepted event ID, and referenced schema.
-
-### Why `custodial_escrow`?
-
-The operator controls the execution path for the incoming payment and outgoing payout. The subtype communicates that custody model rather than implying that the trading participants control the hold-invoice preimage.
-
-A service using an agent-controlled hold invoice must publish and document that as a distinct `lightning_hold_invoice` construction with its own service schema and security assumptions.
 
 ---
 
